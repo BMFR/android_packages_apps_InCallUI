@@ -816,7 +816,44 @@ public class InCallPresenter implements CallList.Listener {
             mInCallActivity = null;
         }
 
-        mStatusBarNotifier.updateNotificationAndLaunchIncomingCallUi(inCallState, mCallList);
+        // check if the user want to have the call UI in background and set it up
+        mCallUiInBackground = Settings.System.getInt(mContext.getContentResolver(),
+                Settings.System.CALL_UI_IN_BACKGROUND, 1) == 1;
+
+        boolean isHeadsUp = false;
+
+        if (mCallUiInBackground) {
+            // get power service to check later if screen is on
+            final PowerManager pm = (PowerManager) mContext.getSystemService(Context.POWER_SERVICE);
+            // check if keyguard is currently shown
+            final IWindowManager windowManagerService = IWindowManager.Stub.asInterface(
+                    ServiceManager.getService(Context.WINDOW_SERVICE));
+            boolean isKeyguardShowing = false;
+            try {
+                isKeyguardShowing = windowManagerService.isKeyguardLocked();
+            } catch (RemoteException e) {
+            }
+            mCallUiInBackground = pm.isScreenOn() && !isKeyguardShowing;
+
+            // Check if user want to see notification as heads up.
+            isHeadsUp = Settings.System.getInt(mContext.getContentResolver(),
+                    Settings.System.CALL_UI_AS_HEADS_UP, 1) == 1;
+        }
+
+        mStatusBarNotifier.updateNotificationAndLaunchIncomingCallUi(
+                inCallState, mCallList, mCallUiInBackground, isHeadsUp);
+    }
+
+    /**
+     * Starts the incoming call Ui immediately used by the incoming call
+     * notification sent from framework's notification mechanism
+     */
+    public void startIncomingCallUi() {
+        // Update the notification and UI this time with fullscreen intent
+        // First cancel the actual notification and then update
+        mStatusBarNotifier.cancelInCall();
+        mStatusBarNotifier.updateNotificationAndLaunchIncomingCallUi(
+                InCallState.INCALL, mCallList, false, false);
     }
 
     /**
