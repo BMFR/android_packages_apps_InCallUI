@@ -1,8 +1,4 @@
 /*
- * Copyright (c) 2013, The Linux Foundation. All rights reserved.
- * Not a Contribution, Apache license notifications and license are retained
- * for attribution purposes only.
- *
  * Copyright (C) 2013 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,11 +19,11 @@ package com.android.incallui;
 import android.content.Context;
 import android.os.Handler;
 import android.os.Message;
+import android.telecom.VideoProfile;
 import android.util.AttributeSet;
 import android.view.View;
 
 import com.android.incallui.widget.multiwaveview.GlowPadView;
-import com.android.services.telephony.common.CallDetails;
 
 /**
  *
@@ -110,46 +106,37 @@ public class GlowPadWrapper extends GlowPadView implements GlowPadView.OnTrigger
         }
     }
 
-    private int toCallType(int resId) {
-        int callType = CallDetails.CALL_TYPE_VOICE;
-        switch (resId) {
-            case R.drawable.ic_lockscreen_answer_video:
-                callType = CallDetails.CALL_TYPE_VT;
-                break;
-            case R.drawable.ic_lockscreen_answer_tx_video:
-                callType = CallDetails.CALL_TYPE_VT_TX;
-                break;
-            case R.drawable.ic_lockscreen_answer_rx_video:
-                callType = CallDetails.CALL_TYPE_VT_RX;
-                break;
-            case R.drawable.ic_lockscreen_answer:
-                callType = CallDetails.CALL_TYPE_VOICE;
-                break;
-            default:
-                Log.wtf(this, "Unknown resource id, resId=" + resId);
-                break;
-        }
-        return callType;
-    }
-
     @Override
     public void onTrigger(View v, int target) {
-        Log.d(this, "onTrigger()");
+        Log.d(this, "onTrigger() view=" + v + " target=" + target);
         final int resId = getResourceIdForTarget(target);
         switch (resId) {
-            case R.drawable.ic_lockscreen_answer_video:
-            case R.drawable.ic_lockscreen_answer_tx_video:
-            case R.drawable.ic_lockscreen_answer_rx_video:
             case R.drawable.ic_lockscreen_answer:
-                mAnswerListener.onAnswer(toCallType(resId));
+                mAnswerListener.onAnswer(VideoProfile.VideoState.AUDIO_ONLY, getContext());
                 mTargetTriggered = true;
                 break;
             case R.drawable.ic_lockscreen_decline:
-                mAnswerListener.onDecline();
+                mAnswerListener.onDecline(getContext());
                 mTargetTriggered = true;
                 break;
             case R.drawable.ic_lockscreen_text:
                 mAnswerListener.onText();
+                mTargetTriggered = true;
+                break;
+            case R.drawable.ic_lockscreen_answer_video:
+                mAnswerListener.onAnswer(VideoProfile.VideoState.BIDIRECTIONAL, getContext());
+                mTargetTriggered = true;
+                break;
+            case R.drawable.ic_lockscreen_answer_tx_video:
+                mAnswerListener.onAnswer(VideoProfile.VideoState.TX_ENABLED, getContext());
+                mTargetTriggered = true;
+                break;
+            case R.drawable.ic_lockscreen_answer_rx_video:
+                mAnswerListener.onAnswer(VideoProfile.VideoState.RX_ENABLED, getContext());
+                mTargetTriggered = true;
+                break;
+            case R.drawable.ic_toolbar_video_off:
+                InCallPresenter.getInstance().declineUpgradeRequest(getContext());
                 mTargetTriggered = true;
                 break;
             default:
@@ -173,8 +160,8 @@ public class GlowPadWrapper extends GlowPadView implements GlowPadView.OnTrigger
     }
 
     public interface AnswerListener {
-        void onAnswer(int callType);
-        void onDecline();
+        void onAnswer(int videoState, Context context);
+        void onDecline(Context context);
         void onText();
     }
 }

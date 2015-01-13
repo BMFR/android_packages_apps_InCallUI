@@ -17,9 +17,9 @@
 package com.android.incallui;
 
 import android.content.Context;
-import android.content.res.Resources;
 import android.os.Bundle;
-import android.telephony.PhoneNumberUtils;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.Editable;
 import android.text.method.DialerKeyListener;
 import android.util.AttributeSet;
@@ -32,8 +32,10 @@ import android.view.ViewTreeObserver;
 import android.view.accessibility.AccessibilityManager;
 import android.widget.EditText;
 import android.widget.LinearLayout;
-import android.widget.TableRow;
 import android.widget.TextView;
+
+import com.android.phone.common.dialpad.DialpadKeyButton;
+import com.android.phone.common.dialpad.DialpadView;
 
 import java.util.HashMap;
 
@@ -44,7 +46,7 @@ public class DialpadFragment extends BaseFragment<DialpadPresenter, DialpadPrese
         implements DialpadPresenter.DialpadUi, View.OnTouchListener, View.OnKeyListener,
         View.OnHoverListener, View.OnClickListener {
 
-    private static final float DIALPAD_SLIDE_FRACTION = 1.0f;
+    private static final int ACCESSIBILITY_DTMF_STOP_DELAY_MILLIS = 50;
 
     /**
      * LinearLayout with getter and setter methods for the translationY property using floats,
@@ -105,6 +107,9 @@ public class DialpadFragment extends BaseFragment<DialpadPresenter, DialpadPrese
     private static final HashMap<Integer, Character> mDisplayMap =
         new HashMap<Integer, Character>();
 
+    private static final Handler sHandler = new Handler(Looper.getMainLooper());
+
+
     /** Set up the static maps*/
     static {
         // Map the buttons to the display characters
@@ -124,6 +129,8 @@ public class DialpadFragment extends BaseFragment<DialpadPresenter, DialpadPrese
 
     // KeyListener used with the "dialpad digits" EditText widget.
     private DTMFKeyListener mDialerKeyListener;
+
+    private DialpadView mDialpadView;
 
     /**
      * Our own key listener, specialized for dealing with DTMF codes.
@@ -183,29 +190,21 @@ public class DialpadFragment extends BaseFragment<DialpadPresenter, DialpadPrese
 
             // find the character
             char c = (char) lookup(event, content);
-            if (mDtmfDialerField != null) {
-                String str = mDtmfDialerField.getText().toString();
-                // if not a long press, and parent onKeyDown accepts the input
-                if (event.getRepeatCount() == 0 && super.onKeyDown(view, content, keyCode, event)) {
 
-                    boolean keyOK = ok(getAcceptedChars(), c);
+            // if not a long press, and parent onKeyDown accepts the input
+            if (event.getRepeatCount() == 0 && super.onKeyDown(view, content, keyCode, event)) {
 
-                    // if the character is a valid dtmf code, start playing the tone and send the
-                    // code.
-                    if (keyOK) {
-                        Log.d(this, "DTMFKeyListener reading '" + c + "' from input.");
-                        if (PhoneNumberUtils.is12Key(c)) {
-                            Log.d(this, "updating display and sending dtmf tone for '" + c + "'");
-                            CallCommandClient.getInstance().playDtmfTone(c, false);
-                        } else {
-                            Log.d(this, "ignoring dtmf request for '" + c + "'");
-                        }
-                    } else {
-                        mDtmfDialerField.setText(str);
-                        Log.d(this, "DTMFKeyListener rejecting '" + c + "' from input.");
-                    }
-                    return true;
+                boolean keyOK = ok(getAcceptedChars(), c);
+
+                // if the character is a valid dtmf code, start playing the tone and send the
+                // code.
+                if (keyOK) {
+                    Log.d(this, "DTMFKeyListener reading '" + c + "' from input.");
+                    getPresenter().processDtmf(c);
+                } else {
+                    Log.d(this, "DTMFKeyListener rejecting '" + c + "' from input.");
                 }
+                return true;
             }
             return false;
         }
@@ -228,7 +227,7 @@ public class DialpadFragment extends BaseFragment<DialpadPresenter, DialpadPrese
 
             if (keyOK) {
                 Log.d(this, "Stopping the tone for '" + c + "'");
-                getPresenter().stopTone();
+                getPresenter().stopDtmf();
                 return true;
             }
 
@@ -280,7 +279,7 @@ public class DialpadFragment extends BaseFragment<DialpadPresenter, DialpadPrese
             // consider checking for this ourselves.
             if (ok(getAcceptedChars(), c)) {
                 Log.d(this, "Stopping the tone for '" + c + "'");
-                getPresenter().stopTone();
+                getPresenter().stopDtmf();
                 return true;
             }
 
@@ -332,7 +331,13 @@ public class DialpadFragment extends BaseFragment<DialpadPresenter, DialpadPrese
             final int id = v.getId();
             // Checking the press state prevents double activation.
             if (!v.isPressed() && mDisplayMap.containsKey(id)) {
-                getPresenter().processDtmf(mDisplayMap.get(id), true /* timedShortTone */);
+                getPresenter().processDtmf(mDisplayMap.get(id));
+                sHandler.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        getPresenter().stopDtmf();
+                    }
+                }, ACCESSIBILITY_DTMF_STOP_DELAY_MILLIS);
             }
         }
     }
@@ -384,7 +389,7 @@ public class DialpadFragment extends BaseFragment<DialpadPresenter, DialpadPrese
                     }
                     break;
                 case KeyEvent.ACTION_UP:
-                    getPresenter().stopTone();
+                    getPresenter().stopDtmf();
                     break;
                 }
                 // do not return true [handled] here, since we want the
@@ -410,7 +415,7 @@ public class DialpadFragment extends BaseFragment<DialpadPresenter, DialpadPrese
                 case MotionEvent.ACTION_UP:
                 case MotionEvent.ACTION_CANCEL:
                     // stop the tone on ANY other event, except for MOVE.
-                    getPresenter().stopTone();
+                    getPresenter().stopDtmf();
                     break;
             }
             // do not return true [handled] here, since we want the
@@ -441,38 +446,19 @@ public class DialpadFragment extends BaseFragment<DialpadPresenter, DialpadPrese
             Bundle savedInstanceState) {
         final View parent = inflater.inflate(
                 com.android.incallui.R.layout.dtmf_twelve_key_dialer_view, container, false);
-        mDtmfDialerField = (EditText) parent.findViewById(R.id.dtmfDialerField);
+        mDialpadView = (DialpadView) parent.findViewById(R.id.dialpad_view);
+        mDialpadView.setCanDigitsBeEdited(false);
+        mDialpadView.setBackgroundResource(R.color.incall_dialpad_background);
+        mDtmfDialerField = (EditText) parent.findViewById(R.id.digits);
         if (mDtmfDialerField != null) {
             mDialerKeyListener = new DTMFKeyListener();
             mDtmfDialerField.setKeyListener(mDialerKeyListener);
             // remove the long-press context menus that support
             // the edit (copy / paste / select) functions.
             mDtmfDialerField.setLongClickable(false);
-
-            setupKeypad(parent);
+            mDtmfDialerField.setElegantTextHeight(false);
+            configureKeypadListeners(mDialpadView);
         }
-
-        final ViewTreeObserver vto = parent.getViewTreeObserver();
-        // Adjust the translation of the DialpadFragment in a preDrawListener instead of in
-        // DialtactsActivity, because at the point in time when the DialpadFragment is added,
-        // its views have not been laid out yet.
-        final ViewTreeObserver.OnPreDrawListener
-                preDrawListener = new ViewTreeObserver.OnPreDrawListener() {
-            @Override
-            public boolean onPreDraw() {
-                if (isHidden()) return true;
-                if (parent.getTranslationY() == 0) {
-                    ((DialpadSlidingLinearLayout) parent)
-                            .setYFraction(DIALPAD_SLIDE_FRACTION);
-                }
-                final ViewTreeObserver vto = parent.getViewTreeObserver();
-                vto.removeOnPreDrawListener(this);
-                return true;
-            }
-
-        };
-
-        vto.addOnPreDrawListener(preDrawListener);
 
         return parent;
     }
@@ -483,6 +469,24 @@ public class DialpadFragment extends BaseFragment<DialpadPresenter, DialpadPrese
         super.onDestroyView();
     }
 
+    /**
+     * Getter for Dialpad text.
+     *
+     * @return String containing current Dialpad EditText text.
+     */
+    public String getDtmfText() {
+        return mDtmfDialerField.getText().toString();
+    }
+
+    /**
+     * Sets the Dialpad text field with some text.
+     *
+     * @param text Text to set Dialpad EditText to.
+     */
+    public void setDtmfText(String text) {
+        mDtmfDialerField.setText(text);
+    }
+
     @Override
     public void setVisible(boolean on) {
         if (on) {
@@ -490,6 +494,14 @@ public class DialpadFragment extends BaseFragment<DialpadPresenter, DialpadPrese
         } else {
             getView().setVisibility(View.INVISIBLE);
         }
+    }
+
+    /**
+     * Starts the slide up animation for the Dialpad keys when the Dialpad is revealed.
+     */
+    public void animateShowDialpad() {
+        final DialpadView dialpadView = (DialpadView) getView().findViewById(R.id.dialpad_view);
+        dialpadView.animateShow();
     }
 
     @Override
@@ -532,43 +544,16 @@ public class DialpadFragment extends BaseFragment<DialpadPresenter, DialpadPrese
         }
     }
 
-    private void setupKeypad(View fragmentView) {
+    private void configureKeypadListeners(View fragmentView) {
         final int[] buttonIds = new int[] {R.id.zero, R.id.one, R.id.two, R.id.three, R.id.four,
                 R.id.five, R.id.six, R.id.seven, R.id.eight, R.id.nine, R.id.star, R.id.pound};
-
-        final int[] numberIds = new int[] {R.string.dialpad_0_number, R.string.dialpad_1_number,
-                R.string.dialpad_2_number, R.string.dialpad_3_number, R.string.dialpad_4_number,
-                R.string.dialpad_5_number, R.string.dialpad_6_number, R.string.dialpad_7_number,
-                R.string.dialpad_8_number, R.string.dialpad_9_number, R.string.dialpad_star_number,
-                R.string.dialpad_pound_number};
-
-        final int[] letterIds = new int[] {R.string.dialpad_0_letters, R.string.dialpad_1_letters,
-                R.string.dialpad_2_letters, R.string.dialpad_3_letters, R.string.dialpad_4_letters,
-                R.string.dialpad_5_letters, R.string.dialpad_6_letters, R.string.dialpad_7_letters,
-                R.string.dialpad_8_letters, R.string.dialpad_9_letters,
-                R.string.dialpad_star_letters, R.string.dialpad_pound_letters};
-
-        final Resources resources = getResources();
-
-        View button;
-        TextView numberView;
-        TextView lettersView;
-
+        DialpadKeyButton dialpadKey;
         for (int i = 0; i < buttonIds.length; i++) {
-            button = fragmentView.findViewById(buttonIds[i]);
-            button.setOnTouchListener(this);
-            button.setClickable(true);
-            button.setOnKeyListener(this);
-            button.setOnHoverListener(this);
-            button.setOnClickListener(this);
-            numberView = (TextView) button.findViewById(R.id.dialpad_key_number);
-            lettersView = (TextView) button.findViewById(R.id.dialpad_key_letters);
-            final String numberString = resources.getString(numberIds[i]);
-            numberView.setText(numberString);
-            button.setContentDescription(numberString);
-            if (lettersView != null) {
-                lettersView.setText(resources.getString(letterIds[i]));
-            }
+            dialpadKey = (DialpadKeyButton) fragmentView.findViewById(buttonIds[i]);
+            dialpadKey.setOnTouchListener(this);
+            dialpadKey.setOnKeyListener(this);
+            dialpadKey.setOnHoverListener(this);
+            dialpadKey.setOnClickListener(this);
         }
     }
 }

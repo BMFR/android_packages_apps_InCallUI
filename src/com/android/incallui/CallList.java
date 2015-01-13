@@ -16,32 +16,34 @@
 
 package com.android.incallui;
 
-import com.google.android.collect.Lists;
-import com.google.android.collect.Maps;
-import com.google.android.collect.Sets;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import com.google.common.base.Preconditions;
 
 import android.os.Handler;
 import android.os.Message;
-import android.text.TextUtils;
+import android.telecom.DisconnectCause;
+import android.telecom.Phone;
+import android.telecom.PhoneAccountHandle;
+import android.telephony.SubscriptionManager;
+import android.telephony.TelephonyManager;
 
-import android.telephony.MSimTelephonyManager;
-import com.android.internal.telephony.MSimConstants;
-import com.android.services.telephony.common.Call;
-import com.android.services.telephony.common.Call.DisconnectCause;
+import com.android.internal.telephony.PhoneConstants;
 
 import java.util.ArrayList;
-import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
- * Maintains the list of active calls received from CallHandlerService and notifies interested
- * classes of changes to the call list as they are received from the telephony stack.
- * Primary lister of changes to this class is InCallPresenter.
+ * Maintains the list of active calls and notifies interested classes of changes to the call list
+ * as they are received from the telephony stack. Primary listener of changes to this class is
+ * InCallPresenter.
  */
-public class CallList {
+public class CallList implements InCallPhoneListener {
 
     private static final int DISCONNECTED_CALL_SHORT_TIMEOUT_MS = 200;
     private static final int DISCONNECTED_CALL_MEDIUM_TIMEOUT_MS = 2000;
@@ -52,16 +54,25 @@ public class CallList {
 
     private static CallList sInstance = new CallList();
 
-    private final HashMap<Integer, Call> mCallMap = Maps.newHashMap();
-    private final HashMap<Integer, ArrayList<String>> mCallTextReponsesMap =
-            Maps.newHashMap();
-    private final Set<Listener> mListeners = Sets.newArraySet();
-    private final HashMap<Integer, List<CallUpdateListener>> mCallUpdateListenerMap = Maps
+    private final HashMap<String, Call> mCallById = new HashMap<>();
+    private final HashMap<android.telecom.Call, Call> mCallByTelecommCall = new HashMap<>();
+    private final HashMap<String, List<String>> mCallTextReponsesMap = Maps.newHashMap();
+    /**
+     * ConcurrentHashMap constructor params: 8 is initial table size, 0.9f is
+     * load factor before resizing, 1 means we only expect a single thread to
+     * access the map so make only a single shard
+     */
+    private final Set<Listener> mListeners = Collections.newSetFromMap(
+            new ConcurrentHashMap<Listener, Boolean>(8, 0.9f, 1));
+    private final HashMap<String, List<CallUpdateListener>> mCallUpdateListenerMap = Maps
             .newHashMap();
 
-    private int mSubscription = 0;
+    private Phone mPhone;
+    private long mSubId = SubscriptionManager.INVALID_SUB_ID;
     private final ArrayList<ActiveSubChangeListener> mActiveSubChangeListeners =
             Lists.newArrayList();
+
+    static final int PHONE_COUNT = TelephonyManager.getDefault().getPhoneCount();
 
     /**
      * Static singleton accessor method.
@@ -70,36 +81,66 @@ public class CallList {
         return sInstance;
     }
 
+    private Phone.Listener mPhoneListener = new Phone.Listener() {
+        @Override
+        public void onCallAdded(Phone phone, android.telecom.Call telecommCall) {
+            Call call = new Call(telecommCall);
+            Log.d(this, "onCallAdded: callState=" + call.getState());
+            if (call.getState() == Call.State.INCOMING ||
+                    call.getState() == Call.State.CALL_WAITING) {
+                onIncoming(call, call.getCannedSmsResponses());
+            } else {
+                onUpdate(call);
+            }
+        }
+        @Override
+        public void onCallRemoved(Phone phone, android.telecom.Call telecommCall) {
+            if (mCallByTelecommCall.containsKey(telecommCall)) {
+                Call call = mCallByTelecommCall.get(telecommCall);
+                call.setState(Call.State.DISCONNECTED);
+                call.setDisconnectCause(new DisconnectCause(DisconnectCause.UNKNOWN));
+                if (updateCallInMap(call)) {
+                    Log.w(this, "Removing call not previously disconnected " + call.getId());
+                }
+                updateCallTextMap(call, null);
+            }
+        }
+    };
+
     /**
      * Private constructor.  Instance should only be acquired through getInstance().
      */
     private CallList() {
     }
 
-    /**
-     * Called when a single call has changed.
-     */
-    public void onUpdate(Call call) {
-        Log.d(this, "onUpdate - ", call);
+    @Override
+    public void setPhone(Phone phone) {
+        mPhone = phone;
+        mPhone.addListener(mPhoneListener);
+    }
 
-        updateActiveSuscription();
+    @Override
+    public void clearPhone() {
+        mPhone.removeListener(mPhoneListener);
+        mPhone = null;
+    }
 
-        updateCallInMap(call);
-        notifyListenersOfChange();
+    int getPhoneId(long subId) {
+        return SubscriptionManager.getPhoneId(subId);
+    }
+
+    long[] getSubId(int phoneId) {
+        return SubscriptionManager.getSubId(phoneId);
     }
 
     /**
      * Called when a single call disconnects.
      */
     public void onDisconnect(Call call) {
-        Log.d(this, "onDisconnect: ", call);
-
-        boolean updated = updateCallInMap(call);
-
-        if (updated) {
+        if (updateCallInMap(call)) {
+            Log.i(this, "onDisconnect: " + call);
             // notify those listening for changes on this specific change
             notifyCallUpdateListeners(call);
-
             // notify those listening for all disconnects
             notifyListenersOfDisconnect(call);
         }
@@ -111,18 +152,19 @@ public class CallList {
     public void onIncoming(Call call, List<String> textMessages) {
         Log.d(this, "onIncoming - " + call);
 
-        // ensure the ringing call is active subscription, since phone state
-        // changed is notified before new incoming call ringing, and the event
-        // will switch active sub to a wrong sub(which is not ringing)
-        if (MSimTelephonyManager.getDefault().isMultiSimEnabled())
-            CallCommandClient.getInstance().setActiveSubscription(call.getSubscription());
-        // will switch active sub to to a incorrect sub(which is not ringing)
-        if (MSimTelephonyManager.getDefault().isMultiSimEnabled()) {
-            CallCommandClient.getInstance().setActiveSubscription(call.getSubscription());
+        // Update active subscription from call object. it will be set by
+        // Telecomm service for incoming call and whenever active sub changes.
+        if (call.mIsActiveSub) {
+            long sub = call.getSubId();
+            Log.d(this, "onIncoming - sub:" + sub + " mSubId:" + mSubId);
+            if (sub != mSubId) {
+                setActiveSubscription(sub);
+            }
         }
-        updateActiveSuscription();
 
-        updateCallInMap(call);
+        if (updateCallInMap(call)) {
+            Log.i(this, "onIncoming - " + call);
+        }
         updateCallTextMap(call, textMessages);
 
         for (Listener listener : mListeners) {
@@ -130,32 +172,34 @@ public class CallList {
         }
     }
 
-    /**
-     * Called when multiple calls have changed.
-     */
-    public void onUpdate(List<Call> callsToUpdate) {
-        Log.d(this, "onUpdate(...)");
-
-        updateActiveSuscription();
-
-        Preconditions.checkNotNull(callsToUpdate);
-        for (Call call : callsToUpdate) {
-            Log.d(this, "\t" + call);
-
-            updateCallInMap(call);
-            updateCallTextMap(call, null);
-
-            notifyCallUpdateListeners(call);
+    public void onUpgradeToVideo(Call call){
+        Log.d(this, "onUpgradeToVideo call=" + call);
+        for (Listener listener : mListeners) {
+            listener.onUpgradeToVideo(call);
         }
-
-        notifyListenersOfChange();
+    }
+    /**
+     * Called when a single call has changed.
+     */
+    public void onUpdate(Call call) {
+        PhoneAccountHandle ph = call.getAccountHandle();
+        Log.d(this, "onUpdate - " + call  + " ph:" + ph);
+        if (call.mIsActiveSub && ph != null && (!ph.getId().equals("E"))) {
+            long sub = call.getSubId();
+            Log.i(this, "onUpdate - sub:" + sub + " mSubId:" + mSubId);
+            if(sub != mSubId) {
+                setActiveSubscription(sub);
+            }
+        }
+        onUpdateCall(call);
+        notifyGenericListeners();
     }
 
     public void notifyCallUpdateListeners(Call call) {
-        final List<CallUpdateListener> listeners = mCallUpdateListenerMap.get(call.getCallId());
+        final List<CallUpdateListener> listeners = mCallUpdateListenerMap.get(call.getId());
         if (listeners != null) {
             for (CallUpdateListener listener : listeners) {
-                listener.onCallStateChanged(call);
+                listener.onCallChanged(call);
             }
         }
     }
@@ -166,10 +210,10 @@ public class CallList {
      * @param callId The call id to get updates for.
      * @param listener The listener to add.
      */
-    public void addCallUpdateListener(int callId, CallUpdateListener listener) {
+    public void addCallUpdateListener(String callId, CallUpdateListener listener) {
         List<CallUpdateListener> listeners = mCallUpdateListenerMap.get(callId);
         if (listeners == null) {
-            listeners = Lists.newArrayList();
+            listeners = new CopyOnWriteArrayList<CallUpdateListener>();
             mCallUpdateListenerMap.put(callId, listeners);
         }
         listeners.add(listener);
@@ -181,7 +225,7 @@ public class CallList {
      * @param callId The call id to remove the listener for.
      * @param listener The listener to remove.
      */
-    public void removeCallUpdateListener(int callId, CallUpdateListener listener) {
+    public void removeCallUpdateListener(String callId, CallUpdateListener listener) {
         List<CallUpdateListener> listeners = mCallUpdateListenerMap.get(callId);
         if (listeners != null) {
             listeners.remove(listener);
@@ -198,8 +242,9 @@ public class CallList {
     }
 
     public void removeListener(Listener listener) {
-        Preconditions.checkNotNull(listener);
-        mListeners.remove(listener);
+        if (listener != null) {
+            mListeners.remove(listener);
+        }
     }
 
     /**
@@ -213,6 +258,25 @@ public class CallList {
             retval = getActiveCall();
         }
         return retval;
+    }
+
+    public Call getOutgoingOrActive() {
+        Call retval = getOutgoingCall();
+        if (retval == null) {
+            retval = getActiveCall();
+        }
+        return retval;
+    }
+
+    /**
+     * A call that is waiting for {@link PhoneAccount} selection
+     */
+    public Call getWaitingForAccountCall() {
+        return getFirstCallWithState(Call.State.PRE_DIAL_WAIT);
+    }
+
+    public Call getPendingOutgoingCall() {
+        return getFirstCallWithState(Call.State.CONNECTING);
     }
 
     public Call getOutgoingCall() {
@@ -263,6 +327,9 @@ public class CallList {
     public Call getFirstCall() {
         Call result = getIncomingCall();
         if (result == null) {
+            result = getPendingOutgoingCall();
+        }
+        if (result == null) {
             result = getOutgoingCall();
         }
         if (result == null) {
@@ -277,20 +344,38 @@ public class CallList {
         return result;
     }
 
-    public Call getCall(int callId) {
-        return mCallMap.get(callId);
+    public boolean hasLiveCall() {
+        Call call = getFirstCall();
+        if (call == null) {
+            return false;
+        }
+        return call != getDisconnectingCall() && call != getDisconnectedCall();
     }
 
-    public boolean existsLiveCall() {
-        for (Call call : mCallMap.values()) {
-            if (!isCallDead(call)) {
-                return true;
+    /**
+     * Returns the first call found in the call map with the specified call modification state.
+     * @param state The session modification state to search for.
+     * @return The first call with the specified state.
+     */
+    public Call getVideoUpgradeRequestCall() {
+        for(Call call : mCallById.values()) {
+            if (call.getSessionModificationState() ==
+                    Call.SessionModificationState.RECEIVED_UPGRADE_TO_VIDEO_REQUEST) {
+                return call;
             }
         }
-        return false;
+        return null;
     }
 
-    public ArrayList<String> getTextResponses(int callId) {
+    public Call getCallById(String callId) {
+        return mCallById.get(callId);
+    }
+
+    public Call getCallByTelecommCall(android.telecom.Call telecommCall) {
+        return mCallByTelecommCall.get(telecommCall);
+    }
+
+    public List<String> getTextResponses(String callId) {
         return mCallTextReponsesMap.get(callId);
     }
 
@@ -301,19 +386,27 @@ public class CallList {
         return getCallWithState(state, 0);
     }
 
+    public boolean isDsdaEnabled() {
+        if (TelephonyManager.getDefault().getMultiSimConfiguration()
+                == TelephonyManager.MultiSimVariants.DSDA) {
+            return true;
+        }
+        return false;
+    }
+
     /**
      * Returns the [position]th call found in the call map with the specified state.
      * TODO: Improve this logic to sort by call time.
      */
     public Call getCallWithState(int state, int positionToFind) {
-        if (MSimTelephonyManager.getDefault().getMultiSimConfiguration()
-                == MSimTelephonyManager.MultiSimVariants.DSDA) {
+        if (state != Call.State.PRE_DIAL_WAIT && getActiveSubscription()
+                != SubscriptionManager.INVALID_SUB_ID && isDsdaEnabled()) {
             return getCallWithState(state, positionToFind, getActiveSubscription());
         }
 
         Call retval = null;
         int position = 0;
-        for (Call call : mCallMap.values()) {
+        for (Call call : mCallById.values()) {
             if (call.getState() == state) {
                 if (position >= positionToFind) {
                     retval = call;
@@ -334,25 +427,39 @@ public class CallList {
      * there can be no active calls, so this is relatively safe thing to do.
      */
     public void clearOnDisconnect() {
-        for (Call call : mCallMap.values()) {
+        for (Call call : mCallById.values()) {
             final int state = call.getState();
             if (state != Call.State.IDLE &&
                     state != Call.State.INVALID &&
                     state != Call.State.DISCONNECTED) {
 
                 call.setState(Call.State.DISCONNECTED);
-                call.setDisconnectCause(DisconnectCause.UNKNOWN);
+                call.setDisconnectCause(new DisconnectCause(DisconnectCause.UNKNOWN));
                 updateCallInMap(call);
             }
         }
-        notifyListenersOfChange();
+        notifyGenericListeners();
+    }
+
+    /**
+     * Processes an update for a single call.
+     *
+     * @param call The call to update.
+     */
+    private void onUpdateCall(Call call) {
+        Log.d(this, "\t" + call);
+        if (updateCallInMap(call)) {
+            Log.i(this, "onUpdate - " + call);
+        }
+        updateCallTextMap(call, call.getCannedSmsResponses());
+        notifyCallUpdateListeners(call);
     }
 
     /**
      * Sends a generic notification to all listeners that something has changed.
      * It is up to the listeners to call back to determine what changed.
      */
-    private void notifyListenersOfChange() {
+    private void notifyGenericListeners() {
         for (Listener listener : mListeners) {
             listener.onCallListChange(this);
         }
@@ -373,38 +480,28 @@ public class CallList {
 
         boolean updated = false;
 
-        final Integer id = new Integer(call.getCallId());
-
         if (call.getState() == Call.State.DISCONNECTED) {
             // update existing (but do not add!!) disconnected calls
-            if (mCallMap.containsKey(id)) {
-                final Call.DisconnectCause disconnCause = call.getDisconnectCause();
-                Log.d(this, "disconnect cause: " + disconnCause);
-                if (disconnCause == Call.DisconnectCause.SRVCC_CALL_DROP) {
-                    Log.d(this, "SRVCC call so silently removing call entry");
-                    //silently remove the call entry
-                    call.setState(Call.State.IDLE);
-                    mCallMap.remove(id);
-                    updated = false;
-                } else {
+            if (mCallById.containsKey(call.getId())) {
 
-                    // For disconnected calls, we want to keep them alive for a few seconds
-                    // so that the UI has a chance to display anything it needs when a
-                    // call is disconnected.
+                // For disconnected calls, we want to keep them alive for a few seconds so that the
+                // UI has a chance to display anything it needs when a call is disconnected.
 
-                    // Set up a timer to destroy the call after X seconds.
-                    final Message msg = mHandler.obtainMessage(EVENT_DISCONNECTED_TIMEOUT, call);
-                    mHandler.sendMessageDelayed(msg, getDelayForDisconnect(call));
+                // Set up a timer to destroy the call after X seconds.
+                final Message msg = mHandler.obtainMessage(EVENT_DISCONNECTED_TIMEOUT, call);
+                mHandler.sendMessageDelayed(msg, getDelayForDisconnect(call));
 
-                    mCallMap.put(id, call);
-                    updated = true;
-               }
+                mCallById.put(call.getId(), call);
+                mCallByTelecommCall.put(call.getTelecommCall(), call);
+                updated = true;
             }
         } else if (!isCallDead(call)) {
-            mCallMap.put(id, call);
+            mCallById.put(call.getId(), call);
+            mCallByTelecommCall.put(call.getTelecommCall(), call);
             updated = true;
-        } else if (mCallMap.containsKey(id)) {
-            mCallMap.remove(id);
+        } else if (mCallById.containsKey(call.getId())) {
+            mCallById.remove(call.getId());
+            mCallByTelecommCall.remove(call.getTelecommCall());
             updated = true;
         }
 
@@ -415,19 +512,19 @@ public class CallList {
         Preconditions.checkState(call.getState() == Call.State.DISCONNECTED);
 
 
-        final Call.DisconnectCause cause = call.getDisconnectCause();
+        final int cause = call.getDisconnectCause().getCode();
         final int delay;
         switch (cause) {
-            case LOCAL:
+            case DisconnectCause.LOCAL:
                 delay = DISCONNECTED_CALL_SHORT_TIMEOUT_MS;
                 break;
-            case NORMAL:
-            case UNKNOWN:
+            case DisconnectCause.REMOTE:
                 delay = DISCONNECTED_CALL_MEDIUM_TIMEOUT_MS;
                 break;
-            case INCOMING_REJECTED:
-            case INCOMING_MISSED:
-                // no delay for missed/rejected incoming calls
+            case DisconnectCause.REJECTED:
+            case DisconnectCause.MISSED:
+            case DisconnectCause.CANCELED:
+                // no delay for missed/rejected incoming calls and canceled outgoing calls.
                 delay = 0;
                 break;
             default:
@@ -441,14 +538,12 @@ public class CallList {
     private void updateCallTextMap(Call call, List<String> textResponses) {
         Preconditions.checkNotNull(call);
 
-        final Integer id = new Integer(call.getCallId());
-
         if (!isCallDead(call)) {
             if (textResponses != null) {
-                mCallTextReponsesMap.put(id, (ArrayList<String>) textResponses);
+                mCallTextReponsesMap.put(call.getId(), textResponses);
             }
-        } else if (mCallMap.containsKey(id)) {
-            mCallTextReponsesMap.remove(id);
+        } else if (mCallById.containsKey(call.getId())) {
+            mCallTextReponsesMap.remove(call.getId());
         }
     }
 
@@ -463,7 +558,25 @@ public class CallList {
     private void finishDisconnectedCall(Call call) {
         call.setState(Call.State.IDLE);
         updateCallInMap(call);
-        notifyListenersOfChange();
+        notifyGenericListeners();
+        if (!hasAnyLiveCall()) {
+           // update to Telecomm service that no active sub
+           TelecomAdapter.getInstance().switchToOtherActiveSub(null, false);
+           mSubId = SubscriptionManager.INVALID_SUB_ID;
+        }
+    }
+
+    /**
+     * Notifies all video calls of a change in device orientation.
+     *
+     * @param rotation The new rotation angle (in degrees).
+     */
+    public void notifyCallsOfDeviceRotation(int rotation) {
+        for (Call call : mCallById.values()) {
+            if (call.getVideoCall() != null) {
+                call.getVideoCall().setDeviceOrientation(rotation);
+            }
+        }
     }
 
     /**
@@ -479,7 +592,7 @@ public class CallList {
                     break;
                 case EVENT_NOTIFY_CHANGE:
                     Log.d(this, "EVENT_NOTIFY_CHANGE: ");
-                    notifyListenersOfChange();
+                    notifyGenericListeners();
                     for (ActiveSubChangeListener listener : mActiveSubChangeListeners) {
                         listener.onActiveSubChanged(getActiveSubscription());
                     }
@@ -504,7 +617,14 @@ public class CallList {
          * incoming calls.
          */
         public void onIncomingCall(Call call);
-
+        /**
+         * Called when a new modify call request comes in
+         * This is the only method that gets called for modify requests. Listeners
+         * that want to perform an action on incoming call should respond in this method
+         * because {@link #onCallListChange} does not automatically get called for
+         * incoming calls.
+         */
+        public void onUpgradeToVideo(Call call);
         /**
          * Called anytime there are changes to the call list.  The change can be switching call
          * states, updating information, etc. This method will NOT be called for new incoming
@@ -522,55 +642,66 @@ public class CallList {
 
     public interface CallUpdateListener {
         // TODO: refactor and limit arg to be call state.  Caller info is not needed.
-        public void onCallStateChanged(Call call);
+        public void onCallChanged(Call call);
     }
 
     /**
      * Called when active subscription changes.
      */
-    public void onActiveSubChanged(int activeSub) {
-        Log.d(this, "onActiveSubChanged  = " + activeSub);
-        if (existsLiveCall(activeSub)) {
+    public void onActiveSubChanged(long activeSub) {
+        Log.i(this, "onActiveSubChanged  = " + activeSub);
+        if (hasAnyLiveCall(activeSub)) {
             setActiveSubscription(activeSub);
         }
     }
 
-    public int getActiveSubscription() {
-        return mSubscription;
+    public long getActiveSubscription() {
+        return mSubId;
     }
 
     /**
      * Called to update the latest active subscription id, and also it
      * notifies the registred clients about subscription change information.
      */
-    public void setActiveSubscription(int subscription) {
-        if (subscription != mSubscription) {
-            Log.i(this, "setActiveSubscription, old = " + mSubscription + " new = " + subscription);
-            mSubscription = subscription;
+    public void setActiveSubscription(long subId) {
+        if (subId != mSubId) {
+            Log.i(this, "setActiveSubscription, old = " + mSubId + " new = " + subId);
+            mSubId = subId;
             final Message msg = mHandler.obtainMessage(EVENT_NOTIFY_CHANGE, null);
             mHandler.sendMessage(msg);
         }
     }
 
-    public boolean existsConnectedCall(int subscription) {
-        for (Call call : mCallMap.values()) {
-            if (!isCallDead(call) && call.getState() != Call.State.DISCONNECTED
-                    && call.getSubscription() == subscription) {
-                return true;
+    /**
+     * Returns true, if any voice call in ACTIVE on the provided subscription.
+     */
+    public boolean hasAnyLiveCall(long subId) {
+        for (Call call : mCallById.values()) {
+            PhoneAccountHandle ph = call.getAccountHandle();
+            try {
+                if (!isCallDead(call) && ph != null && (Long.parseLong(ph.getId()) == subId)) {
+                    Log.i(this, "hasAnyLiveCall sub = " + subId);
+                    return true;
+                }
+            } catch (NumberFormatException e) {
+                Log.w(this,"Sub Id is not a number " + e);
             }
         }
+        Log.i(this, "no active call ");
         return false;
     }
 
     /**
-     * Returns true, if any voice call in ACTIVE on the provided subscription.
+     * Returns true, if any call in ACTIVE on the provided subscription.
      */
-    public boolean existsLiveCall(int subscription) {
-        for (Call call : mCallMap.values()) {
-            if (!isCallDead(call) && (call.getSubscription() == subscription)) {
+    public boolean hasAnyLiveCall() {
+        for (Call call : mCallById.values()) {
+            if (!isCallDead(call)) {
+                Log.i(this, "hasAnyLiveCall call = " + call);
                 return true;
             }
         }
+        Log.i(this, "no active call ");
         return false;
     }
 
@@ -580,23 +711,19 @@ public class CallList {
      * subscription as active subscription i.e user visible subscription.
      * @param retainLch  whether to retain the LCH state of the other active sub
      */
-    public boolean switchToOtherActiveSubscription(boolean retainLch) {
-        int activeSub = getActiveSubscription();
+    public boolean switchToOtherActiveSub(boolean retainLch) {
+        long activeSub = getActiveSubscription();
         boolean subSwitched = false;
 
-        for (int i = 0; i < MSimTelephonyManager.getDefault().getPhoneCount(); i++) {
-            if ((i != activeSub) && existsLiveCall(i)) {
-                Log.i(this, "switchToOtherActiveSubscription, sub = " + i +
+        for (int i = 0; i < PHONE_COUNT; i++) {
+            long[] subId = getSubId(i);
+            if ((subId[0] != activeSub) && hasAnyLiveCall(subId[0])) {
+                Log.i(this, "switchToOtherActiveSub, subId = " + subId[0] +
                         " retainLch = " + retainLch);
                 subSwitched = true;
-                if (retainLch) {
-                    CallCommandClient.getInstance().setSubInConversation(
-                            MSimConstants.INVALID_SUBSCRIPTION);
-                    CallCommandClient.getInstance().setActiveSubscription(i);
-                } else {
-                    CallCommandClient.getInstance().setActiveAndConversationSub(i);
-                }
-                setActiveSubscription(i);
+                TelecomAdapter.getInstance().switchToOtherActiveSub(
+                        String.valueOf(subId[0]), retainLch);
+                setActiveSubscription(subId[0]);
                 break;
             }
         }
@@ -607,11 +734,18 @@ public class CallList {
      * Method to check if there is any live call in a sub other than the one supplied.
      * @param currentSub  The subscription to exclude while checking for active calls.
      */
-    public boolean isAnyOtherSubActive(int currentSub) {
+    public boolean isAnyOtherSubActive(long currentSub) {
         boolean result = false;
-        for (int i = 0; i < MSimTelephonyManager.getDefault().getPhoneCount(); i++) {
-            if ((i != currentSub) && existsLiveCall(i)) {
-                Log.d(this, "Live call found on another sub = " + i);
+        if(!isDsdaEnabled()) {
+            return false;
+        }
+
+        for (int phoneId = 0; phoneId < PHONE_COUNT;
+                phoneId++) {
+            long[] subId = getSubId(phoneId);
+
+            if ((subId[0] != currentSub) && hasAnyLiveCall(subId[0])) {
+                Log.d(this, "Live call found on another sub = " + subId[0]);
                 result = true;
                 break;
             }
@@ -620,25 +754,30 @@ public class CallList {
     }
 
     /**
-     * Its a utility, gets the current active subscription from TeleService and
-     * updates the mSubscription member variable.
-     */
-    public void updateActiveSuscription() {
-        if (!MSimTelephonyManager.getDefault().isMultiSimEnabled()) {
-            return;
-        }
-        setActiveSubscription(CallCommandClient.getInstance().getActiveSubscription());
-    }
-
-    /**
      * Returns the [position]th call which belongs to provided subscription and
      * found in the call map with the specified state.
      */
-    public Call getCallWithState(int state, int positionToFind, int subscription) {
+    public Call getCallWithState(int state, int positionToFind, long subId) {
         Call retval = null;
         int position = 0;
-        for (Call call : mCallMap.values()) {
-            if ((call.getState() == state) && (call.getSubscription() == subscription)) {
+        for (Call call : mCallById.values()) {
+            PhoneAccountHandle ph = call.getAccountHandle();
+            if ((call.getState() == state) && ((ph == null) || ph.getId().equals("E") ||
+                    (call.getSubId() == subId))) {
+                if ((ph == null) && (!call.getTelecommCall().getChildren().isEmpty()) &&
+                        (call.getTelecommCall().getChildren().size() > 1)) {
+                    List<android.telecom.Call> children = call.getTelecommCall().getChildren();
+                    android.telecom.Call child = children.get(0);
+                    PhoneAccountHandle childph = child.getDetails().getAccountHandle();
+                    if (Long.parseLong(childph.getId()) == subId) {
+                        Log.d(this,"getCallWithState:retval = "+call);
+                        retval = call;
+                        break;
+                    } else {
+                        position++;
+                        continue;
+                    }
+                }
                 if (position >= positionToFind) {
                     retval = call;
                     break;
@@ -648,15 +787,6 @@ public class CallList {
             }
         }
         return retval;
-    }
-
-    public Call getCallWithStateAndNumber(int state, String number) {
-        for (Call call : mCallMap.values()) {
-            if (TextUtils.equals(call.getNumber(), number) && call.getState() == state) {
-                return call;
-            }
-        }
-        return null;
     }
 
     public void addActiveSubChangeListener(ActiveSubChangeListener listener) {
@@ -670,6 +800,6 @@ public class CallList {
     }
 
     public interface ActiveSubChangeListener {
-        public void onActiveSubChanged(int subscription);
+        public void onActiveSubChanged(long subId);
     }
 }

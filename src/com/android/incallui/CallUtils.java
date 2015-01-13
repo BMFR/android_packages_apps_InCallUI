@@ -1,4 +1,4 @@
-/* Copyright (c) 2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2014, The Linux Foundation. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -28,110 +28,37 @@
 
 package com.android.incallui;
 
-import com.android.services.telephony.common.Call;
-import com.android.services.telephony.common.CallDetails;
+import android.telecom.VideoProfile;
 import com.google.common.base.Preconditions;
 
 public class CallUtils {
 
-    public static boolean isVideoCall(int callType) {
-        return callType == CallDetails.CALL_TYPE_VT ||
-                callType == CallDetails.CALL_TYPE_VT_TX ||
-                callType == CallDetails.CALL_TYPE_VT_RX ||
-                callType == CallDetails.CALL_TYPE_VT_NODIR ||
-                callType == CallDetails.CALL_TYPE_VT_PAUSE ||
-                callType == CallDetails.CALL_TYPE_VT_RESUME;
-    }
-
-    public static int getCallType(Call call) {
-        final CallDetails cd = getCallDetails(call);
-        return cd != null ? cd.getCallType() : CallDetails.CALL_TYPE_UNKNOWN;
-    }
-
-    public static int getProposedCallType(Call call) {
-        final CallDetails cd = getCallModifyDetails(call);
-        return cd != null ? cd.getCallType() : CallDetails.CALL_TYPE_UNKNOWN;
-    }
-
-    public static boolean hasCallModifyFailed(Call call) {
-        final CallDetails modifyCallDetails = getCallModifyDetails(call);
-        boolean hasError = false;
-        try {
-            if (modifyCallDetails != null && modifyCallDetails.getErrorInfo() != null) {
-                hasError = !modifyCallDetails.getErrorInfo().isEmpty()
-                        && Integer.parseInt(modifyCallDetails.getErrorInfo()) != 0;
-            }
-        } catch (Exception e) {
-            hasError = true;
-        }
-        return hasError;
-    }
-
-    private static CallDetails getCallDetails(Call call) {
-        return call != null ? call.getCallDetails() : null;
-    }
-
-    private static CallDetails getCallModifyDetails(Call call) {
-        return call != null ? call.getCallModifyDetails() : null;
-    }
-
     public static boolean isVideoCall(Call call) {
-        if (call == null || call.getCallDetails() == null) {
-            return false;
-        }
-        return isVideoCall(call.getCallDetails().getCallType());
+        return call != null && VideoProfile.VideoState.isVideo(call.getVideoState());
     }
 
-    public static String fromCallType(int callType) {
-        String str = "";
-        switch (callType) {
-            case CallDetails.CALL_TYPE_VT:
-                str = "VT";
-                break;
-            case CallDetails.CALL_TYPE_VT_TX:
-                str = "VT_TX";
-                break;
-            case CallDetails.CALL_TYPE_VT_RX:
-                str = "VT_RX";
-                break;
-        }
-        return str;
-    }
-
-    public static boolean isImsCall(Call call) {
-        if (call == null) return false;
-        Preconditions.checkNotNull(call.getCallDetails());
-        final int callType = call.getCallDetails().getCallType();
-        final boolean isImsVideoCall = isVideoCall(call);
-        final boolean isImsVoiceCall = (callType == CallDetails.CALL_TYPE_VOICE
-                && call.getCallDetails().getCallDomain() == CallDetails.CALL_DOMAIN_PS);
-        return isImsVideoCall || isImsVoiceCall;
-    }
-
-    public static boolean hasImsCall(CallList callList) {
-        Preconditions.checkNotNull(callList);
-        return isImsCall(callList.getIncomingCall())
-                || isImsCall(callList.getOutgoingCall())
-                || isImsCall(callList.getActiveCall())
-                || isImsCall(callList.getBackgroundCall())
-                || isImsCall(callList.getDisconnectingCall())
-                || isImsCall(callList.getDisconnectedCall());
-    }
-
-    public static boolean isVideoPaused(Call call) {
-        return call!=null && call.getCallDetails().getCallType() == CallDetails.CALL_TYPE_VT_PAUSE;
-    }
-
-    public static boolean areCallsSame(Call call1, Call call2) {
-        if (call1 == null && call2 == null) {
-            return true;
-        } else if (call1 == null || call2 == null) {
-            return false;
-        }
-        return (call1.getCallId() == call2.getCallId());
-    }
-
+    // TODO (ims-vt) Check if special handling is needed for CONF calls.
     public static boolean canVideoPause(Call call) {
-        return isVideoCall(call) &&  call.getState() == Call.State.ACTIVE;
+        return isVideoCall(call) && call.getState() == Call.State.ACTIVE;
     }
+
+    public static VideoProfile makeVideoPauseProfile(Call call) {
+        Preconditions.checkNotNull(call);
+        Preconditions.checkState(!VideoProfile.VideoState.isAudioOnly(call.getVideoState()));
+        return new VideoProfile(toPausedVideoState(call.getVideoState()));
+    }
+
+    public static VideoProfile makeVideoUnPauseProfile(Call call) {
+        Preconditions.checkNotNull(call);
+        return new VideoProfile(toUnPausedVideoState(call.getVideoState()));
+    }
+
+    public static int toUnPausedVideoState(int videoState) {
+        return videoState & (~VideoProfile.VideoState.PAUSED);
+    }
+
+    public static int toPausedVideoState(int videoState) {
+        return videoState | VideoProfile.VideoState.PAUSED;
+    }
+
 }

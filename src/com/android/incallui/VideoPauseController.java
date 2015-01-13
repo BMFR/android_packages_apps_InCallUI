@@ -28,31 +28,122 @@
 
 package com.android.incallui;
 
-import android.content.Context;
-import android.widget.Toast;
-
+import android.os.SystemProperties;
+import android.telecom.VideoProfile;
+import com.android.incallui.Call.State;
 import com.android.incallui.InCallPresenter.InCallState;
 import com.android.incallui.InCallPresenter.InCallStateListener;
 import com.android.incallui.InCallPresenter.IncomingCallListener;
+import com.android.incallui.InCallVideoCallListenerNotifier.SessionModificationListener;
 import com.android.internal.util.Preconditions;
-import com.android.services.telephony.common.Call;
-import com.android.services.telephony.common.CallDetails;
 
 /**
  * The class is responsible for generating video pause/resume request.
  */
-class VideoPauseController implements InCallStateListener, IncomingCallListener {
-    private static final String TAG = "VideoCallPauseController";
+class VideoPauseController implements InCallStateListener, IncomingCallListener,
+        SessionModificationListener {
+    private static final String TAG = "VideoCallPauseController:";
 
-    private CallCommandClient mCallCommandClient;
-    private Context mContext;
+    private class CallContext {
+        public CallContext(Call call) {
+            Preconditions.checkNotNull(call);
+            update(call);
+        }
 
-    private Call mCurrCall = null; // call visible to the user, if any.
+        public void update(Call call) {
+            mCall = Preconditions.checkNotNull(call);
+            mState = call.getState();
+            mId = call.getId();
+            mVideoState = call.getVideoState();
+        }
+
+        public int getState() {
+            return mState;
+        }
+
+        public String getId() {
+            return mId;
+        }
+
+        public int getVideoState() {
+            return mVideoState;
+        }
+
+        public String toString() {
+            return String.format("CallContext {CallId=%s, State=%s, VideoState=",
+                    mId, mState, mVideoState);
+        }
+
+        public Call getCall() {
+            return mCall;
+        }
+
+        private int mState = State.INVALID;
+        private String mId;
+        private int mVideoState;
+        private Call mCall;
+    }
+
+    private InCallPresenter mInCallPresenter;
+    private static VideoPauseController sVideoPauseController;
+
+    private CallContext mPrimaryCallContext = null; // Context of primary call, if any.
     private boolean mIsInBackground = false; // True if UI is not visible, false otherwise.
+    private int mVideoPauseMode = VIDEO_PAUSE_MODE_DISABLED;
 
-    public VideoPauseController(Context context, CallCommandClient callCommandClient) {
-        mCallCommandClient = Preconditions.checkNotNull(callCommandClient);
-        mContext = Preconditions.checkNotNull(context);
+    /**
+     * Stores current video pause mode.
+     * 0 - Video Pause is disabled.
+     * 1 - Video Pause is enabled.
+     */
+    private static final String PROPERTY_VIDEO_PAUSE_MODE = "persist.radio.videopause.mode";
+    private static int VIDEO_PAUSE_MODE_DISABLED = 0;
+    private static int VIDEO_PAUSE_MODE_ENABLED = 1;
+
+    private VideoPauseController() {
+        mVideoPauseMode = SystemProperties.getInt(PROPERTY_VIDEO_PAUSE_MODE,
+                VIDEO_PAUSE_MODE_DISABLED);
+        if (mVideoPauseMode != VIDEO_PAUSE_MODE_ENABLED) { // Validate the mode before using.
+            mVideoPauseMode = VIDEO_PAUSE_MODE_DISABLED;
+        }
+    }
+
+    /*package*/
+    static synchronized VideoPauseController getInstance() {
+        if (sVideoPauseController == null) {
+            sVideoPauseController = new VideoPauseController();
+        }
+        return sVideoPauseController;
+    }
+
+    public void setUp(InCallPresenter inCallPresenter) {
+        if (!isVideoPausedEnabled()) {
+            return;
+        }
+
+        log("setUp...");
+        mInCallPresenter = Preconditions.checkNotNull(inCallPresenter);
+        mInCallPresenter.addListener(this);
+        mInCallPresenter.addIncomingCallListener(this);
+        InCallVideoCallListenerNotifier.getInstance().addSessionModificationListener(this);
+    }
+
+    public void tearDown() {
+        if (!isVideoPausedEnabled()) {
+            return;
+        }
+
+        log("tearDown...");
+        InCallVideoCallListenerNotifier.getInstance().removeSessionModificationListener(this);
+        mInCallPresenter.removeListener(this);
+        mInCallPresenter.removeIncomingCallListener(this);
+        clear();
+    }
+
+    private void clear() {
+        mInCallPresenter = null;
+        mPrimaryCallContext = null;
+        mIsInBackground = false;
     }
 
     /**
@@ -61,79 +152,93 @@ class VideoPauseController implements InCallStateListener, IncomingCallListener 
      * @param callList List of current call.
      */
     @Override
-    public void onStateChange(InCallState state, CallList callList) {
-        log("onStateChange, state=" + state);
+    public void onStateChange(InCallState oldState, InCallState newState, CallList callList) {
+        log("onStateChange, OldState=" + oldState + " NewState=" + newState);
 
         Call call = null;
-        if (state == InCallState.INCOMING) {
+        if (newState == InCallState.INCOMING) {
             call = callList.getIncomingCall();
-        } else if (state == InCallState.OUTGOING) {
+        } else if (newState == InCallState.WAITING_FOR_ACCOUNT) {
+            call = callList.getWaitingForAccountCall();
+        } else if (newState == InCallState.PENDING_OUTGOING) {
+            call = callList.getPendingOutgoingCall();
+        } else if (newState == InCallState.OUTGOING) {
             call = callList.getOutgoingCall();
         } else {
             call = callList.getActiveCall();
         }
 
-        // Check if we should display a toast message.
-        displayToast(call);
-
-        boolean hasPrimaryCallChanged = !CallUtils.areCallsSame(call, mCurrCall);
+        boolean hasPrimaryCallChanged = !areSame(call, mPrimaryCallContext);
         boolean canVideoPause = CallUtils.canVideoPause(call);
         log("onStateChange, hasPrimaryCallChanged=" + hasPrimaryCallChanged);
         log("onStateChange, canVideoPause=" + canVideoPause);
         log("onStateChange, IsInBackground=" + mIsInBackground);
-        log("onStateChange, New call = " + call);
 
-        // Send pause request if outgoing request becomes active while UI is in
-        // background.
-        if (!hasPrimaryCallChanged && isOutgoing(mCurrCall) && canVideoPause && mIsInBackground) {
-            sendRequest(call, false);
+        if (hasPrimaryCallChanged) {
+            onPrimaryCallChanged(call);
+            return;
         }
 
-        // Send pause request if VoLTE call becomes active while UI is in
-        // background.
-        if (!hasPrimaryCallChanged && !CallUtils.isVideoCall(mCurrCall) && canVideoPause
-                && mIsInBackground) {
-            sendRequest(call, false);
+        if (isOutgoing(mPrimaryCallContext) && canVideoPause && mIsInBackground) {
+            // Bring UI to foreground if outgoing request becomes active while UI is in
+            // background.
+            bringToForeground();
+        } else if (!isVideoCall(mPrimaryCallContext) && canVideoPause && mIsInBackground) {
+            // Bring UI to foreground if VoLTE call becomes active while UI is in
+            // background.
+            bringToForeground();
         }
 
-        // Send resume request for the active call, if user rejects incoming
-        // call
-        // and UI is in foreground.
-        if (hasPrimaryCallChanged && isIncomming(mCurrCall) && canVideoPause && !mIsInBackground) {
+        updatePrimaryCallContext(call);
+    }
+
+    private void onPrimaryCallChanged(Call call) {
+        log("onPrimaryCallChanged: New call = " + call);
+        log("onPrimaryCallChanged: Old call = " + mPrimaryCallContext);
+        log("onPrimaryCallChanged, IsInBackground=" + mIsInBackground);
+
+        Preconditions.checkState(!areSame(call, mPrimaryCallContext));
+        final boolean canVideoPause = CallUtils.canVideoPause(call);
+
+        if (isWaitingCall(mPrimaryCallContext) && canVideoPause && !mIsInBackground) {
+            // Send resume request for the active call, if user rejects incoming
+            // call and UI is in foreground.
+            sendRequest(call, true);
+        } else if (isWaitingCall(call) && canVideoPause(mPrimaryCallContext)) {
+            // Send pause request if there is an active video call, and we just received a new
+            // incoming call.
+            sendRequest(mPrimaryCallContext.getCall(), false);
+        } else if (isOutgoing(mPrimaryCallContext) && canVideoPause && !mIsInBackground) {
+            // Send resume request for the active call, if user ends outgoing call
+            // and UI is in foreground.
             sendRequest(call, true);
         }
 
-        // Send resume request for the active call, if user ends outgoing call
-        // and UI is in foreground.
-        if (hasPrimaryCallChanged && isOutgoing(mCurrCall) && canVideoPause && !mIsInBackground) {
-            sendRequest(call, true);
-        }
-
-        // Send pause request for the active call, if the holding call ends
-        // while UI is in background
-        if (hasPrimaryCallChanged && isHolding(mCurrCall) && canVideoPause && mIsInBackground) {
-            sendRequest(call, false);
-        }
-
-        mCurrCall = call;
+        updatePrimaryCallContext(call);
     }
 
     /**
      * The function gets called when InCallUI receives a new incoming call.
      */
     @Override
-    public void onIncomingCall(InCallState state, Call call) {
-        log("onIncomingCall, call=" + call);
+    public void onIncomingCall(InCallState oldState, InCallState newState, Call call) {
+        log("onIncomingCall, OldState=" + oldState + " NewState=" + newState + " Call=" + call);
 
-        if (CallUtils.areCallsSame(call, mCurrCall)) {
+        if (areSame(call, mPrimaryCallContext)) {
             return;
         }
 
-        // Pause current video call, if there is an incoming call.
-        if (CallUtils.canVideoPause(mCurrCall)) {
-            sendRequest(mCurrCall, false);
+        onPrimaryCallChanged(call);
+    }
+
+    private void updatePrimaryCallContext(Call call) {
+        if (call == null) {
+            mPrimaryCallContext = null;
+        } else if (mPrimaryCallContext != null) {
+            mPrimaryCallContext.update(call);
+        } else {
+            mPrimaryCallContext = new CallContext(call);
         }
-        mCurrCall = call;
     }
 
     /**
@@ -141,10 +246,69 @@ class VideoPauseController implements InCallStateListener, IncomingCallListener 
      * @param showing true if UI is in the foreground, false otherwise.
      */
     public void onUiShowing(boolean showing) {
+        if (!isVideoPausedEnabled() || mInCallPresenter == null) {
+            return;
+        }
+
+        final boolean notify = mInCallPresenter.getInCallState() == InCallState.INCALL;
         if (showing) {
-            onResume();
+            onResume(notify);
         } else {
-            onPause();
+            onPause(notify);
+        }
+    }
+
+    @Override
+    public void onUpgradeToVideoRequest(Call call) {
+    }
+
+    @Override
+    public void onUpgradeToVideoSuccess(Call call) {
+    }
+
+    @Override
+    public void onUpgradeToVideoFail(int status, Call call) {
+        // TODO (ims-vt) Automatically bring in call ui to foreground.
+    }
+
+    @Override
+    public void onDowngradeToAudio(Call call) {
+    }
+
+    /**
+     * Called when UI becomes visible. This will send resume request for current video call, if any.
+     */
+    private void onResume(boolean notify) {
+        log("onResume: notify=" + notify);
+
+        mIsInBackground = false;
+        if (canVideoPause(mPrimaryCallContext) && notify) {
+            sendRequest(mPrimaryCallContext.getCall(), true);
+        } else {
+            log("onResume. Ignoring...");
+        }
+    }
+
+    /**
+     * Called when UI becomes invisible. This will send pause request for current video call, if any.
+     */
+    private void onPause(boolean notify) {
+        log("onPause: notify=" + notify);
+
+        mIsInBackground = true;
+        if (canVideoPause(mPrimaryCallContext) && notify) {
+            sendRequest(mPrimaryCallContext.getCall(), false);
+        } else {
+            log("onPause, Ignoring...");
+        }
+    }
+
+    private void bringToForeground() {
+        if (mInCallPresenter != null) {
+            log("Bringing UI to foreground");
+            mInCallPresenter.bringToForeground(false);
+        } else {
+            loge("InCallPresenter is null. Cannot bring UI to foreground");
         }
     }
 
@@ -156,89 +320,70 @@ class VideoPauseController implements InCallStateListener, IncomingCallListener 
     private void sendRequest(Call call, boolean resume) {
         if (resume) {
             log("sending resume request, call=" + call);
-            mCallCommandClient.modifyCallInitiate(call.getCallId(),
-                    CallDetails.CALL_TYPE_VT_RESUME);
+            call.getVideoCall().sendSessionModifyRequest(CallUtils.makeVideoUnPauseProfile(call));
         } else {
             log("sending pause request, call=" + call);
-            mCallCommandClient.modifyCallInitiate(call.getCallId(),
-                    CallDetails.CALL_TYPE_VT_PAUSE);
+            call.getVideoCall().sendSessionModifyRequest(CallUtils.makeVideoPauseProfile(call));
         }
+    }
+
+    private boolean isVideoPausedEnabled() {
+        return mVideoPauseMode != VIDEO_PAUSE_MODE_DISABLED;
+    }
+
+    private static boolean areSame(Call call, CallContext callContext) {
+        if (call == null && callContext == null) {
+            return true;
+        } else if (call == null || callContext == null) {
+            return false;
+        }
+        return call.getId().equals(callContext.getId());
+    }
+
+    private static boolean areSame(CallContext callContext, Call call) {
+        return areSame(call, callContext);
+    }
+
+    private static boolean canVideoPause(CallContext callContext) {
+        return isVideoCall(callContext) && callContext.getState() == Call.State.ACTIVE;
+    }
+
+    private static boolean isVideoCall(CallContext callContext) {
+        return callContext != null && VideoProfile.VideoState.isVideo(callContext.getVideoState());
     }
 
     /**
      * Returns true if call is in incoming/waiting state, false otherwise.
      */
-    private boolean isIncomming(Call call) {
-        return call!=null && call.getState() == Call.State.CALL_WAITING;
+    private static boolean isWaitingCall(CallContext call) {
+        return call != null && (call.getState() == Call.State.CALL_WAITING
+                || call.getState() == Call.State.INCOMING);
+    }
+
+    private static boolean isWaitingCall(Call call) {
+        return call != null && (call.getState() == Call.State.CALL_WAITING
+                || call.getState() == Call.State.INCOMING);
     }
 
     /**
      * Returns true if the call is outgoing, false otherwise
      */
-    private boolean isOutgoing(Call call) {
-        return call!=null && (call.getState() == Call.State.DIALING || call.getState() == Call.State.REDIALING);
+    private static boolean isOutgoing(CallContext call) {
+        return call != null && Call.State.isDialing(call.getState());
     }
 
     /**
      * Returns true if the call is on hold, false otherwise
      */
-    private boolean isHolding(Call call) {
-        return call!=null && call.getState() == Call.State.ONHOLD;
+    private static boolean isHolding(CallContext call) {
+        return call != null && call.getState() == Call.State.ONHOLD;
     }
 
-    /**
-     * Called when UI becomes visible. This will send resume request for current video call, if any.
-     */
-    private void onResume() {
-        log("onResume");
-
-        mIsInBackground = false;
-        if (CallUtils.canVideoPause(mCurrCall)) {
-            sendRequest(mCurrCall, true);
-        } else {
-            log("onResume. Ignoring...");
-        }
+    private void log(String msg) {
+        Log.d(this, TAG + msg);
     }
 
-    /**
-     * Called when UI becomes invisible. This will send pause request for current video call, if any.
-     */
-    private void onPause() {
-        log("onPause");
-
-        mIsInBackground = true;
-        if (CallUtils.canVideoPause(mCurrCall)) {
-            sendRequest(mCurrCall, false);
-        } else {
-            log("onPause, Ignoring...");
-        }
+    private void loge(String msg) {
+        Log.e(this, TAG + msg);
     }
-
-    /**
-     * Displays toast message if video call has been paused/resumed.
-     */
-    private void displayToast(Call newCall) {
-        if (!CallUtils.isVideoCall(newCall)) {
-            log("displayToast Not a video call, ignoring... call " + newCall);
-            return;
-        }
-        boolean primaryChanged = !CallUtils.areCallsSame(mCurrCall, newCall);
-        boolean videoPauseStateChanged = CallUtils.isVideoPaused(mCurrCall) != CallUtils
-                .isVideoPaused(newCall);
-        final String msg = CallUtils.isVideoPaused(newCall) ? "Video Paused" : "Video Resumed";
-        if ((primaryChanged && CallUtils.isVideoPaused(newCall))
-                || (!primaryChanged && videoPauseStateChanged)) {
-            log("Call " + newCall.getCallId() + " has been " + msg);
-            Toast.makeText(mContext, msg, Toast.LENGTH_SHORT).show();
-        }
-    }
-
-    private static void log(String msg) {
-        Log.d(TAG, msg);
-    }
-
-    private static void loge(String msg) {
-        Log.e(TAG, msg);
-    }
-
 }
